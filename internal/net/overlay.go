@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 	"github.com/holiman/uint256"
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore"
 )
 
@@ -181,6 +182,7 @@ func (p *Protocol) Start() error {
 		return err
 	}
 	p.buckets = buckets
+	p.Discovery.RegisterTalkHandler(p.protocolId, p.handleTalkRequest)
 	return nil
 }
 
@@ -232,7 +234,7 @@ func (p *Protocol) setupDiscovery() error {
 	return nil
 }
 
-func (p *Protocol) SendPing(node *enode.Node) error {
+func (p *Protocol) Ping(node *enode.Node) error {
 	enrSeq := p.Discovery.LocalNode().Seq()
 	radiusBytes, err := p.nodeRadius.MarshalSSZ()
 	if err != nil {
@@ -261,32 +263,59 @@ func (p *Protocol) SendPing(node *enode.Node) error {
 	talkRequestBytes = append(talkRequestBytes, PING)
 	talkRequestBytes = append(talkRequestBytes, pingRequestBytes...)
 
+	return p.sendReqAndHandleResp(node, err, talkRequestBytes)
+}
+
+func (p *Protocol) sendReqAndHandleResp(node *enode.Node, err error, talkRequestBytes []byte) error {
 	talkResp, err := p.Discovery.TalkRequest(node, p.protocolId, talkRequestBytes)
 	if err != nil {
+		p.buckets.RemovePeer(peer.ID(node.ID().String()))
 		return err
 	}
 
-	if talkResp[0] == PONG {
+	p.buckets.UpdateLastSuccessfulOutboundQueryAt(peer.ID(node.ID().String()), time.Now())
+
+	switch talkResp[0] {
+	case PONG:
 		pong := &Pong{}
 		err = pong.UnmarshalSSZ(talkResp[1:])
 		if err != nil {
 			return err
 		}
 
-		err = p.ProcessPong(node, pong)
+		err = p.processPong(node, pong)
 		if err != nil {
 			return err
 		}
+
 	}
 
 	return nil
 }
 
-func (p *Protocol) ProcessPong(node *enode.Node, pong *Pong) error {
+func (p *Protocol) processPong(node *enode.Node, pong *Pong) error {
+	customPayload := &PingPongCustomData{}
+	err := customPayload.UnmarshalSSZ(pong.CustomPayload)
+	if err != nil {
+		return err
+	}
+	p.radiusCache.Set([]byte(node.ID().String()), customPayload.Radius)
 	return nil
 }
 
-func (p *Protocol) HandleTalkRequest(id enode.ID, addr *net.UDPAddr, msg []byte) []byte {
+func (p *Protocol) handleTalkRequest(id enode.ID, addr *net.UDPAddr, msg []byte) []byte {
+	if p.buckets.Find(peer.ID(id.String())) == "" {
+		nodes := p.Discovery.Lookup(id)
+		if len(nodes) > 0 && nodes[0].ID() == id {
+			_, err := p.buckets.TryAddPeer(peer.ID(id.String()), true, true)
+			if err != nil {
+				p.log.Error("failed to add peer to buckets", "err", err)
+				return nil
+			}
+		}
+		// TODO: emit event
+	}
+
 	msgCode := msg[0]
 
 	switch msgCode {
@@ -294,14 +323,14 @@ func (p *Protocol) HandleTalkRequest(id enode.ID, addr *net.UDPAddr, msg []byte)
 		pingRequest := &Ping{}
 		err := pingRequest.UnmarshalSSZ(msg[1:])
 		if err != nil {
-			log.Error("failed to unmarshal ping request", "err", err)
+			p.log.Error("failed to unmarshal ping request", "err", err)
 			return nil
 		}
 
 		p.log.Trace("received ping request", "protocol", p.protocolId, "source", id, "pingRequest", pingRequest)
 		resp, err := p.handlePing(id, pingRequest)
 		if err != nil {
-			log.Error("failed to handle ping request", "err", err)
+			p.log.Error("failed to handle ping request", "err", err)
 			return nil
 		}
 
@@ -312,23 +341,31 @@ func (p *Protocol) HandleTalkRequest(id enode.ID, addr *net.UDPAddr, msg []byte)
 }
 
 func (p *Protocol) handlePing(id enode.ID, ping *Ping) ([]byte, error) {
+	pingCustomPayload := &PingPongCustomData{}
+	err := pingCustomPayload.UnmarshalSSZ(ping.CustomPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	p.radiusCache.Set([]byte(id.String()), pingCustomPayload.Radius)
+
 	enrSeq := p.Discovery.LocalNode().Seq()
 	radiusBytes, err := p.nodeRadius.MarshalSSZ()
 	if err != nil {
 		return nil, err
 	}
-	customPayload := &PingPongCustomData{
+	pongCustomPayload := &PingPongCustomData{
 		Radius: radiusBytes,
 	}
 
-	customPayloadBytes, err := customPayload.MarshalSSZ()
+	pongCustomPayloadBytes, err := pongCustomPayload.MarshalSSZ()
 	if err != nil {
 		return nil, err
 	}
 
 	pong := &Pong{
 		EnrSeq:        enrSeq,
-		CustomPayload: customPayloadBytes,
+		CustomPayload: pongCustomPayloadBytes,
 	}
 
 	pongBytes, err := pong.MarshalSSZ()
